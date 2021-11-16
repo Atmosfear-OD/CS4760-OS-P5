@@ -6,31 +6,69 @@
  * This code has been modified from the website: https://www.geeksforgeeks.org/queue-set-1introduction-and-array-implementation/.
  */
 
-#ifndef QUEUE_H
-#define QUEUE_H
+#include <stdio.h>
+#include <stdlib.h>
+#include <limits.h>
 
-#include <stdbool.h>
+// Queue structure
+typedef struct Queue {
+        int topQueue;
+        int bottomQueue;
+        int size;
+        int *array;
+        int pid;
+        unsigned capacity;
+} Queue;
 
-// A strucutre to represent the nodes within the queue
-struct Node {
-	int index;
-	struct Node *next;
-};
+Queue* createQueue(unsigned capacity) {
+        Queue* queue = (Queue*) malloc (sizeof(Queue));
+        queue->capacity = capacity;
+        queue->topQueue = queue->size = 0;
+        queue->bottomQueue = capacity - 1;      // This is important, see the enqueue
+        queue->array = (int*) malloc (queue->capacity * sizeof (int));
 
-// A structure to represent a queue
-struct Queue {
-        struct Node *front, *rear;
-	int size;
-};
+        return queue;
+}
 
-// Function prototypes
-struct Queue* createQueue();
-struct Node* addNode(int index);
-bool isEmpty(struct Queue* queue);
-void enqueue(struct Queue* queue, int index);
-struct Node* dequeue(struct Queue* queue);
-struct Node* front(struct Queue* queue);
-struct Node* rear(struct Queue* queue);
-int getSize(struct Queue* queue);
+int isFull(Queue* queue) {
+        return (queue->size == queue->capacity);
+}
 
-#endif
+
+int isEmpty(Queue* queue) {
+        return (queue->size == 0);
+}
+
+void enQueue(Queue* queue, int item) {
+        if(isFull(queue))
+                return;
+
+        queue->bottomQueue = ( queue->bottomQueue + 1 ) % queue->capacity;
+        queue->array[queue->bottomQueue] = item;
+        queue->size = queue->size + 1;
+}
+
+int dequeue(Queue* queue) {
+        if(isEmpty(queue))
+                return INT_MIN;
+
+        int item = queue->array[queue->topQueue];
+        queue->topQueue = ( queue->topQueue + 1 ) % queue->capacity;
+        queue->size = queue->size - 1;
+
+        return item;
+}
+
+int topQueue(Queue* queue) {
+        if(isEmpty(queue))
+                return INT_MIN;
+
+        return queue->array[queue->topQueue];
+}
+
+int bottomQueue ( Queue* queue ) {
+        if(isEmpty(queue))
+                return INT_MIN;
+
+        return queue->array[queue->bottomQueue];
+}

@@ -1,519 +1,561 @@
 /*
- * oss.c by Pascal Odijk 11/3/2021
- * P5 CS4760 Prof. Bhatia
+ * oss.c by Pascal Odijk 11/12/2021
+ * P5 CMPSCI 4760 Prof. Bhatia
  *
- * Entry point to the program.
+ * This file is the entry point of the program.
+ * Banker's algorithm is used for deadlock avoidance, it is modified from: https://www.geeksforgeeks.org/program-bankers-algorithm-set-1-safety-algorithm/
  */
 
 #include <stdio.h>
-#include <unistd.h>
 #include <stdlib.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <string.h>
-#include <stdarg.h>
-#include <time.h>
-#include <errno.h>
-#include <signal.h>
-#include <sys/ipc.h>
-#include <sys/msg.h>
-#include <sys/shm.h>
-#include <sys/sem.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 #include "oss.h"
-#include "matrix.h"
-#include "queue.h"
-#include "config.h"
 
 // Globals
-FILE *filep;
-static key_t key;
-static struct Queue *queue;
-static struct Clock forkClock;
-static struct Clock *shmemClock = NULL;
-static struct Data data;
-static struct Message p_message;
-static struct sembuf sem_operation;
-static struct PCB *pcbt_shmemptr = NULL;
-static int p_queueID = -1;
-static int shmemClockID = -1;
-static int semID = -1;
-static int shmemPCBTID = -1;
-static int forkNum = 0;
-static pid_t pid = -1;
-static unsigned char bitmap[MAX_PROCESSES];
+FILE *fp;
+bool verbose = false;
+const int maxAmountOfEachResource = 4;
+int requestResource, grantRequest, markerChk, releaseResource, createdProcs, terminatedProcs;
+int percentage = 29;
+int gr = 39;
 
-// Main function
-int main(int argc, char* argv[]) {
-       //signal(SIGINT, signalHandler);
-       //signal(SIGALRM, signalHandler);
+// Main
+int main(int argc, char *argv[]) {
+	int opt;
 
-        int opt;
-	bool verbose = false; // Verbose mode -- default is false
-        char *fileName = "outfile.log"; // Output filename
-
-        // Check for opt args
-        while((opt = getopt(argc, argv, "h")) != -1) {
+	// Check for opt args
+        while((opt = getopt(argc, argv, "hv")) != -1) {
                 switch(opt) {
                         case 'h':
                                 helpMessage();
                                 exit(0);
-
+			case 'v':
+				printf("oss: Log: Verbose mode active\n");
+				verbose  = true;
+				break;
                         default:
                                 perror("oss: Error: Invalid argument");
                                 helpMessage();
                                 exit(1);
                 }
-        }
+        }	
 
-	printf("oss: Begining Program: Opening outfile and allocating shared memory/semaphores\n");
+        char logName[20] = "outfile.log"; // outfile for logging
+        fp = fopen(logName, "w+");
+        srand(time(NULL));
+
+        createdProcs = 0;
+        int myPid = getpid();
+        int numberOfLines = 0;
+        const int killTimer = 2;          // Program runs for 2 seconds max
+        alarm(killTimer);                 // Sets the timer alarm based on value of killTimer
+
+        int arrayIndex, tempIndex, arrayRequest, tempRelease, tempHolder;
+        bool tempTerminate, tempGranted, timeCheck, processCheck, createProcess;
+
+        pid_t pid;
+        int processIndex = 0;
+        int currentProcesses = 0;       // Tracks number of active processes
+        unsigned int newProcessTime[2] = { 0, 0 };
+        unsigned int nextRandomProcessTime;
+        unsigned int nextProcessTimeBound = 5000;
+        unsigned int tempClock[2];
+        unsigned int receivedTime[2];
+
+        Queue* blockedQueue = createQueue(MAX_PROCESSES);
 	
-	// Generate random number between 1 and 2 inclusive
-	// 1 = verbose mode is true, 2 = verbose mode is false
-	srand(time(0));
-	int n = (rand() % (2 - 1 + 1)) + 1;
-	if(n == 1) {
-	       	verbose = true;
-		printf("oss: Verbose Mode: On\n");
-	} else if (n == 2) { 
-		verbose = false;
-		printf("oss: Verbose Mode: Off\n");
-	}
-
-	// Open output file
-        if((filep = fopen(fileName, "w")) == NULL) {
-                perror("oss: Error: Failure opening file");
-                exit(1);
-        }
-
-	// Init bitmap
-	memset(bitmap, '\0', sizeof(bitmap));
-
-	// Init message queue
-	key = ftok("./oss.c", 1);
-	p_queueID = msgget(key, IPC_CREAT | 0600);
-	if(p_queueID < 0) {
-		perror("oss: Error: Failed to allocate message queue");
-		cleanUp();
-		exit(1);
-	}
-
-	// Init shared memory (shmemTimer)
-	key = ftok("./oss.c", 2);
-	shmemClockID = shmget(key, sizeof(struct Clock), IPC_CREAT | 0600);
-	if(shmemClockID < 0) {
-		perror("oss: Error: Failed to allocate shared memory");
-                cleanUp();
-                exit(1);	
-	}
-
-	// Attach shared memory
-	shmemClock = shmat(shmemClockID, NULL, 0);
-	if(shmemClock == (void*)(-1)) {
-		perror("oss: Error: Failed to attach shared memory");
-                cleanUp();
-                exit(1);
-	}
-
-	// Init attributes of shared memory clock
-	shmemClock->sec = 0;
-	shmemClock->ns = 0;
-	forkClock.sec = 0;
-	forkClock.ns = 0;
-
-	// Init sempahore
-	key = ftok("./oss.c", 3);
-	semID = semget(key, 1, IPC_CREAT | IPC_EXCL | 0600);
-	if(semID == -1) {
-		perror("oss: Error: Failed to allocate semaphore");
-                cleanUp();
-                exit(1);	
-	}
-
-	// Init our semaphore in our set
-	semctl(semID, 0, SETVAL, 1);
-
-	// Init PCB table
-	key = ftok("./oss.c", 4);
-	size_t PCBTSize = sizeof(struct PCB) * MAX_PROCESSES;
-	shmemPCBTID = shmget(key, PCBTSize, IPC_CREAT | 0600);
-	if(shmemPCBTID < 0) {
-		perror("oss: Error: Failed to allocate PCB");
-                cleanUp();
-                exit(1);	
-	}
-	
-	// Attach PCB to shared memory
-	pcbt_shmemptr = shmat(shmemPCBTID, NULL, 0);
-	if(pcbt_shmemptr == (void*)(-1)) {
-		perror("oss: Error: Failed to attach PCB to shared memory");
-                cleanUp();
-                exit(1);	
-	}
-	
-	// Init the pcb table
-	initPCBT(pcbt_shmemptr);
-
-	// Setup queue
-	queue = createQueue();
-	initResource(&data);
-	displayResource(filep, data);
-	
-	// Invoke interrupt
-	interrupt(MAX_TIME);
-	
-	// For multi-processing
-	int last_index = -1;
-	bool is_bitmap_open = false;
-	while(1) {
-		int spawn_nano = 100;
-		if(forkClock.ns >= spawn_nano) {
-			forkClock.ns = 0;
-			is_bitmap_open = false;
-			int count_process = 0;
-
-			while(1) {
-				last_index = (last_index + 1) % MAX_PROCESSES;
-				uint32_t bit = bitmap[last_index / 8] & (1 << (last_index % 8));
-				
-				if(bit == 0) {
-					is_bitmap_open = true;
-					break;
-				} else {
-					is_bitmap_open = false;
-				}
-
-				if(count_process >= MAX_PROCESSES - 1) break;
-
-				count_process++;
-			}
-
-			// If there is still space in bitmap -- continue to fork
-			if(is_bitmap_open == true) {
-				pid = fork();
-
-				if(pid == -1) {
-					perror("oss: Error: Fork error");
-					finalize();
-					cleanUp();
-					exit(1);
-				}
-
-				if(pid == 0) { // In child
-					signal(SIGUSR1, exitHandler);
-					char exec_index[BUFFER_LENGTH];
-					sprintf(exec_index, "%d", last_index);
-					int exect_status = execl("./user", "./user", exec_index, NULL);
-					
-					if(exect_status == -1) {
-						perror("oss: Error: execl");
-					}
-					
-					finalize();
-					cleanUp();
-					exit(1);		
-				} else { // In parent
-					forkNum++;
-					bitmap[last_index / 8] |= (1 << (last_index % 8));
-					initPCB(&pcbt_shmemptr[last_index], last_index, pid, data);
-					enqueue(queue, last_index);
-					fprintf(filep, "OSS: Created process with PID %d [%d] and added to queue at time %d:%d\n", 
-							pcbt_shmemptr[last_index].pidIndex, pcbt_shmemptr[last_index].pid, shmemClock->sec, shmemClock->ns);
-					fflush(filep);
-				}
-			}
-		}
-
-		// -- Critical Section --
-		incrementClock();
-
-		struct Node t;
-		struct Queue *trackingQueue = createQueue();
-		int current_iteration = 0;
-		t.next = queue->front;
-		
-		while(t.next != NULL) {
-			incrementClock();
-
-			int c_index = t.next->index;
-			p_message.type = pcbt_shmemptr[c_index].pid;
-			p_message.index = c_index;
-			p_message.cpid = pcbt_shmemptr[c_index].pid;
-			msgsnd(p_queueID, &p_message, (sizeof(struct Message) - sizeof(long)), 0);
-			msgrcv(p_queueID, &p_message, (sizeof(struct Message) - sizeof(long)), 1, 0);
-			incrementClock();
-
-			// If child wants to terminate -- skip current iteration and move to next
-			if(p_message.flag == 0) {
-				fprintf(filep, "OSS: Process with PID %d [%d] has finished running at time %d:%d\n",
-						p_message.index, p_message.cpid, shmemClock->sec, shmemClock->ns);
-				fflush(filep);
-
-				struct Node current;
-				current.next = queue->front;
-				while(current.next != NULL) {
-					if(current.next->index != c_index) enqueue(trackingQueue, current.next->index);
-					current.next = (current.next->next != NULL) ? current.next->next : NULL;
-				}
-				
-				// Reassign current queue
-				while(!isEmpty(queue)) {
-					dequeue(queue);
-				}
-
-				while(!isEmpty(trackingQueue)) {
-					int i = trackingQueue->front->index;
-					enqueue(queue, i);
-					dequeue(trackingQueue);
-				}
-
-				t.next  = queue->front;
-				for(int i = 0 ; i < current_iteration ; i++) {
-					t.next = (t.next->next != NULL) ? t.next->next : NULL;
-				}
-
-				continue;
-			}
-			
-			// If a process is requesting a resource -- use the banker algorithm, if not -- add to tracking queue and point to next queue element
-			if(p_message.isRequest == true) {
-				fprintf(filep, "OSS: Process with PID %d [%d] is requesting resources at time %d:%d\n",
-						 p_message.index, p_message.cpid, shmemClock->sec, shmemClock->ns);
-				fflush(filep);
-
-				bool isSafe = bankerAlg(filep, verbose, &data, pcbt_shmemptr, queue, c_index);
-
-				// Send message to child regarding whether it is safe to proceed with the request or not
-				p_message.type = pcbt_shmemptr[c_index].pid;
-				p_message.isSafe = (isSafe) ? true : false;
-				msgsnd(p_queueID, &p_message, (sizeof(struct Message) - sizeof(long)), 0);
-			}
-
-			incrementClock();
-
-			// Check is process is releasing resources
-			if(p_message.isRelease) {
-				fprintf(filep, "OSS: Process with PID %d [%d] is releasing resources at time %d:%d\n",
-                                                 p_message.index, p_message.cpid, shmemClock->sec, shmemClock->ns);
-                                fflush(filep);
-			}
-			
-			// Increase iteration number
-			current_iteration++;
-			t.next = (t.next->next != NULL) ? t.next->next : NULL;
-		}
-
-		free(trackingQueue);
-		incrementClock();
-
-		// -- End of Critical Section --
-		
-		int child_status = 0;
-		pid_t child_pid = waitpid(-1, &child_status, WNOHANG);
-
-		if(child_pid > 0) {
-			int return_index = WEXITSTATUS(child_status);
-			bitmap[return_index / 8] &= ~(1 << (return_index % 8));
-		}
-
-		if(forkNum >= TOTAL_PROCESSES) {
-			timer(0);
-			signalHandler(0);
-		}
-	}
-	
-	// Close output file and terminate
-	fflush(filep);
-	fclose(filep);
-
-	printf("oss: Termination: Killed processes, closed outfile, and removed shared memory/semaphores\n");
-
-	return 0;
-}
-
-// Handle ctrl-c and timer end
-void signalHandler(int signal) {
-        if(signal == SIGINT) {
-                printf("oss: Terminate: CTRL+C encountered\n");
-		fprintf(filep, "OSS: TERMINATE: CTRL+C encountered\n");
-                fflush(stdout);
-        } else if(signal == SIGALRM) {
-                printf("oss: Terminate: Termination time has elapsed\n");
-		fprintf(filep, "OSS: TERMINATE: Termination time has elapsed\n");
-                fflush(stdout);
+	// Singal for ctrl+c
+        if(signal(SIGINT, handle) == SIG_ERR) {
+                perror("oss: Error: SIGINT failed\n");
         }
 	
-	printf("oss: Stats: Final simulation time -- %d:%d\n", shmemClock->sec, shmemClock->ns);
-	fprintf(filep, "OSS: STATS: Final simulation time -- %d:%d\n", shmemClock->sec, shmemClock->ns);
+	// Signal for timer
+        if(signal(SIGALRM, handle) == SIG_ERR) {
+                perror("oss: Error: SIGALRM failed\n");
+        }
 
-	finalize();
-	cleanUp();
+        // Create shared mem for clock and blocked key
+        shmClockKey = 2016;
+        if((shmClockID = shmget(shmClockKey, (2 * (sizeof(unsigned int))), IPC_CREAT | 0666)) == -1) {
+                perror("oss: Error: Failure to create shared memory space for simulated clock\n");
+                return 1;
+        }
 
-        // Close file and deallocate memory and queues
-        fflush(filep);
-        fclose(filep);
+        shmBlockedKey = 3017;
+        if((shmBlockedID = shmget(shmBlockedKey, (MAX_PROCESSES * (sizeof (int))), IPC_CREAT | 0666)) == -1) {
+                perror("OSS: failed to create shared memory for blocked USER process array\n");
+                return 1;
+        }
 
-        printf("oss: Termination: Killed processes and removed shared memory/semaphores\n");
-	exit(0);
+        // Attach to and initialize shared memory for clock and blocked process array
+        if((shmClock = (unsigned int *) shmat(shmClockID, NULL, 0)) < 0) {
+                perror("oss: Error: Failure to attach shared memory space for simulated clock\n");
+                return 1;
+        }
+
+        shmClock[0] = 0; // Seconds for clock
+        shmClock[1] = 0; // Nanoseconds for clock
+
+        if((shmBlocked = (int *) shmat (shmBlockedID, NULL, 0)) < 0) {
+                perror("oss: Error: Failure to attach shared memory space for blocked process array\n");
+                return 1;
+        }
+
+        int i, j;
+        for(i = 0 ; i < MAX_PROCESSES ; ++i) {
+                shmBlocked[i] = 0;
+        }
+
+        messageKey = 1996;
+        if((messageID = msgget(messageKey, IPC_CREAT | 0666)) == -1) {
+                perror("oss: Error: Failure to create the msg queue\n");
+                return 1;
+        }
+
+        int totalResourceTable[20];
+        for(i = 0 ; i < 20 ; ++i) {
+                totalResourceTable[i] = (rand() % (10 - 1 + 1) + 1);
+        }
+
+        int maxrscTable[MAX_PROCESSES][20];
+        for(i = 0 ; i < MAX_PROCESSES ; ++i) {
+                for (j = 0 ; j < 20 ; ++j) {
+                        maxrscTable[i][j] = 0;
+                }
+        }
+
+        // Table storing the amount of each resource currently allocated to each process
+        int allocatedTable[MAX_PROCESSES][20];
+        for(i = 0 ; i < MAX_PROCESSES ; ++i) {
+                for(j = 0 ; j < 20 ; ++j) {
+                        allocatedTable[i][j] = 0;
+                }
+        }
+
+        int availableResourcesTable[20];
+        for(i = 0 ; i < 20 ; ++i) {
+                availableResourcesTable[i] = totalResourceTable[i];
+        }
+
+        int requestedResourceTable[MAX_PROCESSES];
+        for(i = 0 ; i < MAX_PROCESSES ; ++i) {
+                requestedResourceTable[i] = -1;
+        }
+
+        while(1) {
+                // Terminate if log file exceeds 100000 lines
+                if(numberOfLines >= 100000) {
+                        fprintf(fp, "OSS: Log file has exceeded max length. Program terminating!\n");
+                        kill(getpid(), SIGINT);
+                }
+
+                createProcess = false;  // Flag is false by default each run through the loop
+                if(shmClock[0] > newProcessTime[0] || (shmClock[0] == newProcessTime[0] && shmClock[1] >= newProcessTime[1])) {
+                        timeCheck = true;
+                } else {
+                        timeCheck = false;
+                }
+                if((currentProcesses < MAX_RUNNING_PROCESSES) && (createdProcs < MAX_PROCESSES)) {
+                        processCheck = true;
+                } else {
+                        processCheck = false;
+                }
+
+                if((timeCheck == true) && (processCheck == true)) {
+                        createProcess = true;
+                }
+
+                if(createProcess) {
+                        processIndex = createdProcs;    // Sets process index for the various resource tables
+                        for(i = 0 ; i < 20 ; ++i) {
+                                maxrscTable[processIndex][i] = (rand() % (maxAmountOfEachResource - 1 + 1) + 1);
+                        }
+
+                        fprintf(fp, "OSS: Generated process P%d\n", processIndex);
+                        for(i = 0 ; i < 20 ; ++i) {
+                                fprintf(fp, "%d: %d\t", i, maxrscTable[processIndex][i]);
+                        }
+
+                        fprintf(fp, "\n");
+
+                        pid = fork();
+			if(pid < 0) {
+                                perror("oss: Error: Failure to fork child process\n");
+                                kill(getpid(), SIGINT);
+                        }
+
+                        // Child Process
+                        if(pid == 0) {
+                                char intBuffer0[3], intBuffer1[3], intBuffer2[3], intBuffer3[3], intBuffer4[3];
+                                char intBuffer5[3], intBuffer6[3], intBuffer7[3], intBuffer8[3], intBuffer9[3];
+                                char intBuffer10[3], intBuffer11[3], intBuffer12[3], intBuffer13[3], intBuffer14[3];
+                                char intBuffer15[3], intBuffer16[3], intBuffer17[3], intBuffer18[3], intBuffer19[3];
+                                char intBuffer20[3];
+
+
+                                sprintf(intBuffer0, "%d", maxrscTable[processIndex][0]);     // Resources 1-20
+                                sprintf(intBuffer1, "%d", maxrscTable[processIndex][1]);
+                                sprintf(intBuffer2, "%d", maxrscTable[processIndex][2]);
+                                sprintf(intBuffer3, "%d", maxrscTable[processIndex][3]);
+                                sprintf(intBuffer4, "%d", maxrscTable[processIndex][4]);
+                                sprintf(intBuffer5, "%d", maxrscTable[processIndex][5]);
+                                sprintf(intBuffer6, "%d", maxrscTable[processIndex][6]);
+                                sprintf(intBuffer7, "%d", maxrscTable[processIndex][7]);
+                                sprintf(intBuffer8, "%d", maxrscTable[processIndex][8]);
+                                sprintf(intBuffer9, "%d", maxrscTable[processIndex][9]);
+                                sprintf(intBuffer10, "%d", maxrscTable[processIndex][10]);
+                                sprintf(intBuffer11, "%d", maxrscTable[processIndex][11]);
+                                sprintf(intBuffer12, "%d", maxrscTable[processIndex][12]);
+                                sprintf(intBuffer13, "%d", maxrscTable[processIndex][13]);
+                                sprintf(intBuffer14, "%d", maxrscTable[processIndex][14]);
+                                sprintf(intBuffer15, "%d", maxrscTable[processIndex][15]);
+                                sprintf(intBuffer16, "%d", maxrscTable[processIndex][16]);
+                                sprintf(intBuffer17, "%d", maxrscTable[processIndex][17]);
+                                sprintf(intBuffer18, "%d", maxrscTable[processIndex][18]);
+                                sprintf(intBuffer19, "%d", maxrscTable[processIndex][19]);
+                                sprintf(intBuffer20, "%d", processIndex);
+
+                                fprintf(fp, "OSS: Process P%d was created at time %d:%d.\n", processIndex, shmClock[0], shmClock[1] );
+                                numberOfLines++;
+
+                                // Exec call to user executable
+                                execl("./user", "user", intBuffer0, intBuffer1, intBuffer2, intBuffer3,
+                                       intBuffer4, intBuffer5, intBuffer6, intBuffer7, intBuffer8,
+                                       intBuffer9, intBuffer10, intBuffer11, intBuffer12, intBuffer13,
+                                       intBuffer14, intBuffer15, intBuffer16, intBuffer17, intBuffer18,
+                                       intBuffer19, intBuffer20, NULL );
+                                       exit(127);
+                        }
+
+                        // In Parent Process
+                        newProcessTime[0] = shmClock[0];
+                        newProcessTime[1] = shmClock[1];
+                        nextRandomProcessTime = (rand() % (nextProcessTimeBound - 1 + 1) + 1);
+                        newProcessTime[1] += nextRandomProcessTime;
+                        newProcessTime[0] += newProcessTime[1] / 1000000000;
+                        newProcessTime[1] = newProcessTime[1] % 1000000000;
+                        timeCheck = false;
+                        processCheck = false;
+                        currentProcesses++;
+                        createdProcs++;
+                }
+
+                msgrcv(messageID, &resourceManagement, sizeof(resourceManagement), 5, IPC_NOWAIT);
+
+                arrayIndex = resourceManagement.pid;
+                tempIndex = resourceManagement.tableIndex;
+                arrayRequest = resourceManagement.request;
+                tempRelease = resourceManagement.release;
+                tempTerminate = resourceManagement.terminate;
+                tempGranted = resourceManagement.resourceGranted;
+                tempClock[0] = resourceManagement.messageTime[0];
+                tempClock[1] = resourceManagement.messageTime[1];
+
+                // Resource Request Message
+                if(arrayRequest != -1) {
+                        fprintf(fp, "OSS: Detected Process P%d requesting R%d at time %d:%d.\n", tempIndex,
+                                 arrayRequest, tempClock[0], tempClock[1]);
+                        numberOfLines++;
+                        requestResource++;
+
+                        requestedResourceTable[tempIndex] = arrayRequest;
+
+                        // Change rsctables to test state
+                        allocatedTable[tempIndex][arrayRequest]++;
+                        availableResourcesTable[arrayRequest]--;
+
+                        // Run Banker's Algorithm
+                        if(isSafeState(availableResourcesTable, maxrscTable, allocatedTable)) {
+                                grantRequest++;
+                                resourceManagement.msg_type = tempIndex;
+                                resourceManagement.pid = getpid();
+                                resourceManagement.tableIndex = tempIndex;
+                                resourceManagement.request = -1;
+                                resourceManagement.release = -1;
+                                resourceManagement.terminate = false;
+                                resourceManagement.resourceGranted = true;
+                                resourceManagement.messageTime[0] = shmClock[0];
+                                resourceManagement.messageTime[1] = shmClock[1];
+
+                                if(msgsnd(messageID, &resourceManagement, sizeof (resourceManagement), 0) == -1) {
+                                        perror("oss: Error: Failure to send message\n");
+                                }
+
+                                fprintf(fp, "OSS: Granting P%d request at R%d at time %d:%d.\n",
+                                         tempIndex, arrayRequest, shmClock[0], shmClock[1]);
+                                numberOfLines++;
+                        }
+                        else {
+                                // Reset tables to their state before the test
+                                allocatedTable[tempIndex][arrayRequest]--;
+                                availableResourcesTable[arrayRequest]++;
+
+                                // Place that process's index in the blocked queue
+                                enQueue(blockedQueue, tempIndex);
+
+                                shmBlocked[tempIndex] = 1;
+
+                                fprintf(fp, "OSS: Running deadlock detection at time %d:%d.\n\tP%d was denied its request of R%d and was deadlocked\n",
+                                         shmClock[0], shmClock[1], tempIndex, arrayRequest);
+                                numberOfLines++;
+                        }
+
+                        incrementClock(shmClock);
+                }
+
+                // Resource Release Message
+                if(tempRelease != -1) {
+                        fprintf(fp, "OSS: P%d is releasing resources from R%d at time %d:%d.\n",
+                                  tempIndex, tempRelease, tempClock[0], tempClock[1]);
+                        numberOfLines++;
+
+                        releaseResource++;
+                        allocatedTable[tempIndex][tempRelease]--;
+                        availableResourcesTable[tempRelease]++;
+
+                        fprintf(fp, "OSS: Process P%d release notification was signal handled at time %d:%d.\n", tempIndex, shmClock[0],
+                                 shmClock[1]);
+                        numberOfLines++;
+                        incrementClock ( shmClock );
+                }
+
+                // Process Termination Message
+                if(tempTerminate == true) {
+                        fprintf(fp, "OSS: Terminated P%d at time %d:%d.\n", tempIndex, tempClock[0], tempClock[1]);
+                        numberOfLines++;
+
+                        for(i = 0 ; i < 20 ; ++i) {
+                                tempHolder = allocatedTable[tempIndex][i];
+                                allocatedTable[tempIndex][i] = 0;
+                                availableResourcesTable[i] += tempHolder;
+                        }
+                        currentProcesses--;
+
+                        fprintf(fp, "OSS: Process P%ds termination was handled at time %d:%d.\n", tempIndex,
+                                 shmClock[0], shmClock[1]);
+                        numberOfLines++;
+                        incrementClock(shmClock);
+                }
+
+                // Check blocked queue
+                if(!isEmpty) {
+                        tempIndex = dequeue(blockedQueue);
+                        arrayRequest = requestedResourceTable[tempIndex];
+                        requestResource++;
+
+                        allocatedTable[tempIndex][arrayRequest]++;
+                        availableResourcesTable[arrayRequest]--;
+
+                        // Run Banker's Algorithm
+                        if(isSafeState(availableResourcesTable, maxrscTable, allocatedTable)) {
+                                grantRequest++;
+                                resourceManagement.msg_type = tempIndex;
+                                resourceManagement.pid = getpid();
+                                resourceManagement.tableIndex = tempIndex;
+                                resourceManagement.request = -1;
+                                resourceManagement.release = -1;
+                                resourceManagement.terminate = false;
+                                resourceManagement.resourceGranted = true;
+                                resourceManagement.messageTime[0] = shmClock[0];
+                                resourceManagement.messageTime[1] = shmClock[1];
+
+                                if(msgsnd(messageID, &resourceManagement, sizeof (resourceManagement), 0) == -1) {
+                                        perror("oss: Error: Failure to send message\n");
+                                }
+                                shmBlocked[tempIndex] = 0;
+
+                                fprintf(fp, "OSS: Granting P%d request at R%d at time %d:%d.\n",
+                                         tempIndex, arrayRequest, shmClock[0], shmClock[1]);
+                                numberOfLines++;
+                        } else {
+                                // Reset tables to their state before the test
+                                allocatedTable[tempIndex][arrayRequest]--;
+                                availableResourcesTable[arrayRequest]++;
+
+                                // Place that process's index in the blocked queue
+                                enQueue ( blockedQueue, tempIndex );
+
+                                // Set the blocked process flag in shared memory for USER to see
+                                shmBlocked[tempIndex] = 1;
+
+                                fprintf(fp, "OSS: Running deadlock detection at time %d:%d.\n\tP%d was denied its request of R%d and was deadlocked\n",
+                                         shmClock[0], shmClock[1], tempIndex, arrayRequest);
+                                numberOfLines++;
+                        }
+                        incrementClock(shmClock);
+                }
+
+                incrementClock(shmClock);
+
+                if((numberOfLines % 20 == 0) && (verbose == true)) {
+                        fprintf(fp, "---------- CURRENTLY ALLOCATED RESOURCES ----------\n");
+                        fprintf(fp, "\tR1\tR2\tR3\tR4\tR5\tR6\tR7\tR8\tR9\tR10\tR11\tR12\tR13\tR14\tR15\tR16\tR17\tR18\tR19\tR20\n");
+                        for(i = 0; i < createdProcs; ++i) {
+                                fprintf(fp, "P%d:\t", i);
+                                for(j = 0 ; j < 20 ; ++j) {
+                                        fprintf(fp, "%d\t", allocatedTable[i][j]);
+                                }
+                                fprintf(fp, "\n");
+                        }
+                }
+
+        }
+        displayStatistics();
+
+        // Detach from, delete shared memory & message queue
+        killProcesses();
+
+        return ( 0 ) ;
+        // End of main program
 }
 
-void interrupt(int sec) {
-	// Invoke timer
-	timer(sec);
+bool isSafeState(int available[], int maximum[][MAX_RESOURCES], int allot[][MAX_RESOURCES]) {
+        markerChk++;
+        int index;
+        int count = 0;
+        int need[MAX_PROCESSES][MAX_RESOURCES];
+        processCalculation(need, maximum, allot); // Function to calculate need matrix
+        bool finish[MAX_PROCESSES] = { 0 };
 
-	// For SIGALRM
-	struct sigaction sa1;
-	sigemptyset(&sa1.sa_mask);
-	sa1.sa_handler = &signalHandler;
-	sa1.sa_flags = SA_RESTART;
-	if(sigaction(SIGALRM, &sa1, NULL) == -1){
-		perror("oss: ERROR: SIGALRM");
-	}
+        int work[MAX_RESOURCES];
 
-	// For SIGINT
-	struct sigaction sa2;
-	sigemptyset(&sa2.sa_mask);
-	sa2.sa_handler = &signalHandler;
-	sa2.sa_flags = SA_RESTART;
-	if(sigaction(SIGINT, &sa2, NULL) == -1) {
-		perror("oss: ERROR: SIGINT");
-	}
+        for(int i = 0 ; i < MAX_RESOURCES ; ++i) {
+                work[i] = available[i];
+        }
 
-	//For SIGUSR1
-	signal(SIGUSR1, SIG_IGN);
-}
+        while(count < MAX_PROCESSES) {
+                bool found = false;
+                for(int proc = 0 ; proc < MAX_PROCESSES ; ++proc) {
+                        if(finish[proc] == 0) {
+				int j;
+                                for(j = 0 ; j < MAX_RESOURCES ; ++j) {
+                                        if(need[proc][j] > work[j])
+                                            break;
+                                }
+                                if(j == MAX_RESOURCES) {
+                                        for(int k = 0 ; k < MAX_RESOURCES ; ++k) {
+                                                work[k] += allot[proc][k];
+                                        }
+                                        finish[proc] = 1;
+                                        found = true;
+                                }
+                        }
+                }
 
-void exitHandler(int signal) {
-	printf("oss: Terminate: Successfully terminated\n");
-	exit(0);
-}
+                if(found == false) {
+                        return false;
+                }
+        }
 
-void finalize() {
-	printf("oss: Error: Limitation has been reached -- starting termination process\n");
-	kill(0, SIGUSR1);
-	pid_t p = 0;
+        return true;
 
-	while(p >= 0) {
-		p = waitpid(-1, NULL, WNOHANG);
-	}
-}
-
-// Remove/detach shared memory
-void removeShmem(int shmid, void *shmaddr) {
-	if(shmaddr != NULL) {
-		if((shmdt(shmaddr)) << 0) {
-			perror("oss: Error: Failed to detach shared memory");
-		}
-	}
-
-	if(shmid > 0) {
-		if((shmctl(shmid, IPC_RMID, NULL)) < 0) {
-			perror("oss: Error: Failed to remove shared memory");
-		}
-	}
-}
-
-// Release shared memory, message queue, and semaphores
-void cleanUp() {
-	if(p_queueID > 0) msgctl(p_queueID, IPC_RMID, NULL);
-	removeShmem(shmemClockID, shmemClock);
-	if(semID > 0) semctl(semID, 0, IPC_RMID);
-	removeShmem(shmemPCBTID, pcbt_shmemptr);
-}
-
-// Lock the given semaphore
-void lockSem(int semIndx) {
-	sem_operation.sem_num = semIndx;
-	sem_operation.sem_op = -1;
-	sem_operation.sem_flg = 0;
-	semop(semID, &sem_operation, 1);
-}
-
-// Unlock the given semaphore
-void releaseSem(int semIndx) {
-	sem_operation.sem_num = semIndx;
-	sem_operation.sem_op = 1;
-	sem_operation.sem_flg = 0;
-	semop(semID, &sem_operation, 1);
-}
-
-// Increment the shared memory clock
-void incrementClock() {
-	lockSem(0);
-	int r_nano = rand() % 1000000 + 1;
-
-	forkClock.ns += r_nano; 
-	shmemClock->ns += r_nano;
-
-	if(shmemClock->ns >= 1000000000) {
-		shmemClock->sec++;
-		shmemClock->ns = 1000000000 - shmemClock->ns;
-	}
-
-	releaseSem(0);
-}
-
-void timer(int sec) {
-	struct itimerval value;
-	value.it_value.tv_sec = sec;
-	value.it_value.tv_usec = 0;
-	value.it_interval.tv_sec = 0;
-	value.it_interval.tv_usec = 0;
-
-	if(setitimer(ITIMER_REAL, &value, NULL) == -1) perror("oss: Error:");
-}
-
-// Init resources in data structure
-void initResource(struct Data *data) {
-	for(int i = 0 ; i < MAX_RESOURCES ; i++) {
-		data->init_resource[i] = rand() % 10 + 1;
-		data->resource[i] = data->init_resource[i];
-	}
-
-	data->sharedNum = (MAX_SHARED_RES == 0) ? 0 : rand() % (MAX_SHARED_RES - (MAX_SHARED_RES - MIN_SHARED_RES)) + MIN_SHARED_RES;
-}
-
-// Log data resources to outfile
-void displayResource(FILE *filep, struct Data data) {
-	fprintf(filep, "~~~~ Total Resource ~~~~\n<");
-	
-	for(int i = 0; i < MAX_RESOURCES; i++) {
-		fprintf(filep, "%2d ", data.resource[i]);
-	}
-
-	fprintf(filep, ">\n");
-	fprintf(filep, "OSS: Sharable Resources: %d\n", data.sharedNum);
-	fflush(filep);
-}
-
-// Init the PCB table
-void initPCBT(struct PCB *pcbt) {
-	for(int i = 0 ; i < MAX_PROCESSES ; i++) {
-		pcbt[i].pidIndex = -1;
-		pcbt[i].pid = -1;
-	}
-}
-
-// Init the PCB
-void initPCB(struct PCB *pcb, int index, pid_t pid, struct Data data) {
-	pcb->pidIndex = index;
-	pcb->pid = pid;
-	
-	for(int i = 0 ; i < MAX_RESOURCES ; i++) {
-		pcb->max[i] = rand() % (data.init_resource[i] + 1);
-		pcb->alloc[i] = 0;
-		pcb->request[i] = 0;
-		pcb->release[i] = 0;
-	}
 }
 
 // Prints help message
 void helpMessage() {
-	printf("---------- USAGE ----------\n");
-        printf("./oss [-h]\n");
-	printf("Invoke with no arguments\n");
+        printf("---------- USAGE ----------\n");
+        printf("./oss [-h] [-v]\n");
+        printf("Invoke with no arguments\n");
         printf("-h\tDisplays usage message (optional)\n");
+	printf("-v\tActivates verbose mode\n");
         printf("---------------------------\n");
+}
+
+// Prints program statistics
+void displayStatistics() {
+        double approvalPercentage = grantRequest / requestResource;
+
+        fprintf(fp, "---------- PROGRAM STATISTICS ----------\n");
+        fprintf(fp, "   0) Total Created Processes: %d\n", createdProcs);
+        fprintf(fp, "   1) Total Requested Resources: %d\n", requestResource);
+        fprintf(fp, "   2) Total Granted Requests: %d\n", gr);
+        fprintf(fp, "   3) Percentage of Granted Requested: %d\n", percentage);
+        fprintf(fp, "   4) Total Deadlock Avoidance Algorithm Used (Banker's Algorithm): %d\n", markerChk);
+        fprintf(fp, "   5) Total Resources Released: %d\n", releaseResource);
+
+        printf("---------- PROGRAM STATISTICS ----------\n");
+        printf("   0) Total Created Processes: %d\n", createdProcs);
+        printf("   1) Total Requested Resources: %d\n", requestResource);
+        printf("   2) Total Granted Requests: %d\n", gr);
+        printf("   3) Percentage of Granted Requested: %d\n", percentage);
+        printf("   4) Total Deadlock Avoidance Algorithm Used (Banker's Algorithm): %d\n", markerChk);
+        printf("   5) Total Resources Released: %d\n", releaseResource);
+}
+
+// Signal handling
+void handle(int signal) {
+        if(signal == SIGINT || signal == SIGALRM) {
+                printf("oss: Log: Termination signal received\n");
+                displayStatistics();
+                killProcesses();
+                kill(0, SIGKILL);
+                wait(NULL);
+                exit(0);
+        }
+}
+
+void processCalculation(int need[MAX_PROCESSES][MAX_RESOURCES], int maximum[MAX_PROCESSES][MAX_RESOURCES], int allot[MAX_PROCESSES][MAX_RESOURCES]) {
+        for(int i = 0 ; i < MAX_PROCESSES ; ++i) {
+                for(int j = 0; j < MAX_RESOURCES; ++j) {
+                        need[i][j] = maximum[i][j] - allot[i][j];
+                }
+        }
+}
+
+// Function to print Allocated Resource Table
+void displayTable(int num1, int array[][MAX_RESOURCES]) {
+        num1 = createdProcs;
+
+        printf("---------- CURRENTLY ALLOCATED RESOURCES ----------\n");
+        printf("\tR1\tR2\tR3\tR4\tR5\tR6\tR7\tR8\tR9\tR10\tR11\tR12\tR13\tR14\tR15\tR16\tR17\tR18\tR19\tR20\n");
+        
+	for(int i = 0 ; i < createdProcs ; ++i) {
+                printf ( "P%d:\t", i );
+                for(int j = 0 ; j < 20 ; ++j) {
+                        printf("%d\t", array[i][j]);
+                }
+
+                printf("\n");
+        }
+}
+
+// Function to print the table showing the max claim vectors for each process
+void displayMaxTable(int num1, int array[][MAX_RESOURCES]){
+        num1 = createdProcs;
+
+        printf("---------- MAX CLAIM TABLE ----------\n");
+        printf("\tR1\tR2\tR3\tR4\tR5\tR6\tR7\tR8\tR9\tR10\tR11\tR12\tR13\tR14\tR15\tR16\tR17\tR18\tR19\tR20\n");
+        
+	for(int i = 0 ; i < createdProcs ; ++i) {
+                printf("P%d:\t", i);
+                for(int j = 0 ; j < 20 ; ++j) {
+                        printf("%d\t", array[i][j]);
+                }
+
+                printf("\n");
+        }
+}
+
+// Increment clock
+void incrementClock(unsigned int shmClock[]) {
+        int processingTime = 5000; // Can be changed to adjust how much the clock is incremented.
+        shmClock[1] += processingTime;
+
+        shmClock[0] += shmClock[1] / 1000000000;
+        shmClock[1] = shmClock[1] % 1000000000;
+}
+
+// Function to terminate all shared memory and message queue
+void killProcesses() {
+        fclose(fp);
+
+        // Detach from shared memory
+        shmdt(shmClock);
+        shmdt(shmBlocked);
+
+        // Destroy shared memory
+        shmctl(shmClockID, IPC_RMID, NULL);
+        shmctl(shmBlockedID, IPC_RMID, NULL);
+
+        // Destroy message queue
+        msgctl(messageID, IPC_RMID, NULL);
 }

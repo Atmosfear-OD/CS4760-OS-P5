@@ -1,12 +1,12 @@
 /*
- * oss.h by Pascal Odijk 11/12/2021
+ * user.h by Pascal Odijk 11/12/2021
  * P5 CMPSCI 4760 Prof. Bhatia
  *
- * This is the header file for oss.c. It contains the function prototypes.
+ * This is the header file for user.c. It contains the function prototypes.
  */
 
-#ifndef OSS_H
-#define OSS_H
+#ifndef USER_H
+#define USER_H
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,16 +24,9 @@
 #include <sys/time.h>
 #include <stdbool.h>
 #include "config.h"
-#include "queue.h"
 
 // Function prototypes
-bool isSafeState();
-void helpMessage();
-void processCalculation();
-void incrementClock();
-void displayTable();
-void displayMaxTable();
-void displayStatistics();
-void killProcesses();
+bool hasResourcesToRelease();
+bool canRequestMore();
 
 #endif
